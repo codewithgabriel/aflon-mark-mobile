@@ -39,6 +39,13 @@ export default function StaffLayout() {
           tabBarIcon: ({ color }) => <MaterialCommunityIcons name="history" size={24} color={color} />,
         }}
       />
+      <Tabs.Screen
+        name="stats"
+        options={{
+          title: 'My Stats',
+          tabBarIcon: ({ color }) => <MaterialCommunityIcons name="chart-bar" size={24} color={color} />,
+        }}
+      />
     </Tabs>
   );
 }

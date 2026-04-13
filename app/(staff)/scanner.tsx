@@ -19,8 +19,8 @@ type AttendanceRecord = {
 };
 
 type AttendanceTimes = {
-  checkInStart: string;
   checkInEnd: string;
+  checkInClose: string;
   checkOutStart: string;
   checkOutEnd: string;
 };
@@ -150,7 +150,7 @@ export default function ScannerScreen() {
             <View style={styles.timeRow}>
               <MaterialCommunityIcons name="login" size={14} color="#10b981" />
               <Text style={styles.timeLabel}>Check-In</Text>
-              <Text style={styles.timeValue}>{times.checkInStart} – {times.checkInEnd} <Text style={styles.timeSub}>(on-time)</Text></Text>
+              <Text style={styles.timeValue}>On-time before {times.checkInEnd} <Text style={styles.timeSub}>(closes {times.checkInClose})</Text></Text>
             </View>
             <View style={[styles.timeRow, { marginTop: 8 }]}>
               <MaterialCommunityIcons name="logout" size={14} color="#60a5fa" />
