@@ -14,7 +14,7 @@ type AttendanceRecord = {
   date: string;
   checkInTime: string;
   checkOutTime: string | null;
-  status: 'Present' | 'Late' | 'Absent';
+  status: 'Early' | 'OnTime' | 'Present' | 'Late' | 'Absent';
 };
 
 type MonthlySummary = {

@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Image, ImageBackground, KeyboardAvoidingView, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, Image, ImageBackground, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { Colors } from '../../constants/Colors';
 import { Styles } from '../../constants/Styles';
 import { useAuth } from '../../context/AuthContext';
@@ -49,9 +49,14 @@ export default function LoginScreen() {
       </View>
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
       >
-        <View style={{ flex: 1, justifyContent: 'center', padding: 24 }}>
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
           <View style={{ alignItems: 'center', marginBottom: 48 }}>
             <Image
               source={require('../../assets/logo.png')}
@@ -76,11 +81,20 @@ export default function LoginScreen() {
                 onChangeText={setEmail}
                 keyboardType="email-address"
                 autoCapitalize="none"
+                autoComplete="email"
+                textContentType="emailAddress"
               />
             </View>
 
             <View style={Styles.inputGroup}>
-              <Text style={Styles.label}>Password</Text>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <Text style={Styles.label}>Password</Text>
+                <TouchableOpacity onPress={() => router.push('/(auth)/forgot-password')}>
+                  <Text style={{ color: Colors.light.primary, fontSize: 12, fontWeight: '600' }}>
+                    Forgot Password?
+                  </Text>
+                </TouchableOpacity>
+              </View>
               <TextInput
                 style={Styles.input}
                 placeholder="••••••••"
@@ -88,6 +102,8 @@ export default function LoginScreen() {
                 secureTextEntry
                 value={password}
                 onChangeText={setPassword}
+                autoComplete="password"
+                textContentType="password"
               />
             </View>
 
@@ -110,7 +126,7 @@ export default function LoginScreen() {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </ScrollView>
       </KeyboardAvoidingView>
     </ImageBackground>
   );

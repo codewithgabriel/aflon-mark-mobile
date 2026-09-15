@@ -15,7 +15,7 @@ type AttendanceRecord = {
   date: string;          // "YYYY-MM-DD"
   checkInTime: string;   // ISO 8601
   checkOutTime: string | null;
-  status: 'Present' | 'Late' | 'Absent';
+  status: 'Early' | 'OnTime' | 'Present' | 'Late' | 'Absent';
 };
 
 type AttendanceTimes = {
@@ -23,6 +23,8 @@ type AttendanceTimes = {
   checkInClose: string;
   checkOutStart: string;
   checkOutEnd: string;
+  fridayCheckOutStart: string;
+  fridayCheckOutEnd: string;
 };
 
 export default function ScannerScreen() {
@@ -33,8 +35,9 @@ export default function ScannerScreen() {
   const [resultMessage, setResultMessage] = useState('');
   const [mode, setMode] = useState<'IN' | 'OUT'>('IN');
   const [times, setTimes] = useState<AttendanceTimes>({
-    checkInStart: '07:00', checkInEnd: '09:00',
+    checkInEnd: '09:00', checkInClose: '11:00',
     checkOutStart: '15:00', checkOutEnd: '20:00',
+    fridayCheckOutStart: '', fridayCheckOutEnd: '',
   });
   const { user } = useAuth();
 
@@ -155,7 +158,18 @@ export default function ScannerScreen() {
             <View style={[styles.timeRow, { marginTop: 8 }]}>
               <MaterialCommunityIcons name="logout" size={14} color="#60a5fa" />
               <Text style={styles.timeLabel}>Check-Out</Text>
-              <Text style={styles.timeValue}>{times.checkOutStart} – {times.checkOutEnd}</Text>
+              {(() => {
+                const isFriday = new Date().getDay() === 5;
+                const useFriday = isFriday && times.fridayCheckOutStart && times.fridayCheckOutEnd;
+                const start = useFriday ? times.fridayCheckOutStart : times.checkOutStart;
+                const end = useFriday ? times.fridayCheckOutEnd : times.checkOutEnd;
+                return (
+                  <Text style={styles.timeValue}>
+                    {start} – {end}
+                    {useFriday ? <Text style={styles.timeSub}> (Friday)</Text> : null}
+                  </Text>
+                );
+              })()}
             </View>
           </View>
 

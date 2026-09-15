@@ -6,16 +6,31 @@
   "build": {
     "development": {
       "developmentClient": true,
-      "distribution": "internal"
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "http://localhost:3000",
+        "EXPO_PUBLIC_API_SECRET": "supersecret_aflon_key_123"
+      }
     },
     "preview": {
       "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
       "env": {
-        ""
+        "EXPO_PUBLIC_BACKEND_URL": "https://aflon-mark-backend.vercel.app",
+        "EXPO_PUBLIC_API_SECRET": "supersecret_aflon_key_123"
       }
     },
     "production": {
-      "autoIncrement": true
+      "autoIncrement": true,
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://aflon-mark-backend.vercel.app",
+        "EXPO_PUBLIC_API_SECRET": "supersecret_aflon_key_123"
+      }
     }
   },
   "submit": {
