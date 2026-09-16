@@ -21,6 +21,11 @@ const getBaseUrl = () => {
     return `http://${ip}:3000`;
   }
 
+  // In production builds (or when no dev host exists), default to live Vercel backend
+  if (!__DEV__) {
+    return 'https://aflon-mark-backend.vercel.app';
+  }
+
   return 'http://localhost:3000';
 };
 
