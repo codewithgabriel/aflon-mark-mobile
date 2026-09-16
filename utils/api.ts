@@ -1,9 +1,21 @@
 import Constants from 'expo-constants';
 
 const getBaseUrl = () => {
-  if (process.env.EXPO_PUBLIC_BACKEND_URL) return process.env.EXPO_PUBLIC_BACKEND_URL;
-
+  const configured = process.env.EXPO_PUBLIC_BACKEND_URL;
   const hostUri = Constants.expoConfig?.hostUri;
+
+  if (configured) {
+    if (configured.includes('localhost') && hostUri) {
+      const ip = hostUri.split(':')[0];
+      const portMatch = configured.match(/:(\d+)/);
+      const port = portMatch ? portMatch[1] : '3000';
+      const resolved = `http://${ip}:${port}`;
+      console.log(`[API] Auto-corrected localhost to device host: ${resolved}`);
+      return resolved;
+    }
+    return configured;
+  }
+
   if (hostUri) {
     const ip = hostUri.split(':')[0];
     return `http://${ip}:3000`;
