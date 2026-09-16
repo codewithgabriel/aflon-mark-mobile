@@ -1,10 +1,23 @@
-import { useRouter, useLocalSearchParams } from 'expo-router';
-import React, { useState, useEffect } from 'react';
-import { ActivityIndicator, Alert, Image, ImageBackground, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
-import { Colors } from '../../constants/Colors';
-import { Styles } from '../../constants/Styles';
-import { fetchAPI, APIError } from '../../utils/api';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+import React, { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  ImageBackground,
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  TouchableWithoutFeedback,
+  View,
+} from 'react-native';
+import { APIError, fetchAPI } from '../../utils/api';
 
 export default function ResetPasswordScreen() {
   const [password, setPassword] = useState('');
@@ -18,25 +31,25 @@ export default function ResetPasswordScreen() {
 
   useEffect(() => {
     if (!token) {
-      Alert.alert('Error', 'Invalid reset link. Please request a new password reset.', [
-        { text: 'OK', onPress: () => router.replace('/(auth)/login') },
+      Alert.alert('Invalid Link', 'This password reset link is invalid or incomplete. Please request a new link.', [
+        { text: 'Return to Sign In', onPress: () => router.replace('/(auth)/login') },
       ]);
     }
   }, [token]);
 
   const handleResetPassword = async () => {
     if (!password || !confirmPassword) {
-      Alert.alert('Error', 'Please fill in all fields.');
+      Alert.alert('Missing Input', 'Please fill in both password fields.');
       return;
     }
 
     if (password.length < 8) {
-      Alert.alert('Error', 'Password must be at least 8 characters long.');
+      Alert.alert('Password Length', 'Password must be at least 8 characters long.');
       return;
     }
 
     if (password !== confirmPassword) {
-      Alert.alert('Error', 'Passwords do not match.');
+      Alert.alert('Mismatch', 'Passwords do not match. Please verify and try again.');
       return;
     }
 
@@ -48,11 +61,11 @@ export default function ResetPasswordScreen() {
       });
 
       Alert.alert(
-        'Success',
-        'Your password has been reset successfully. You can now sign in with your new password.',
+        'Password Updated',
+        'Your password has been reset successfully. You can now sign in with your new credentials.',
         [
           {
-            text: 'OK',
+            text: 'Sign In Now',
             onPress: () => router.replace('/(auth)/login'),
           },
         ]
@@ -60,11 +73,11 @@ export default function ResetPasswordScreen() {
     } catch (err: any) {
       const title = err instanceof APIError && err.status === 0 ? 'Connection Error' : 'Reset Failed';
       let message = err.message || 'Unable to reset your password. Please try again.';
-      
+
       if (err.message?.includes('expired') || err.message?.includes('invalid')) {
         message = 'This reset link has expired or is invalid. Please request a new one.';
       }
-      
+
       Alert.alert(title, message);
     } finally {
       setLoading(false);
@@ -72,152 +85,228 @@ export default function ResetPasswordScreen() {
   };
 
   return (
-    <ImageBackground
-      source={require('../../assets/background.png')}
-      style={{ flex: 1 }}
-      imageStyle={{ top: -100 }}
-      resizeMode="cover"
-    >
-      <View style={StyleSheet.absoluteFillObject}>
-        <View style={{ flex: 1, backgroundColor: 'rgba(0, 51, 102, 0.75)' }} />
-      </View>
-      <KeyboardAvoidingView
+    <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+      <ImageBackground
+        source={require('../../assets/background.png')}
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+        imageStyle={{ top: -80 }}
+        resizeMode="cover"
       >
-        <ScrollView
-          contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
+        <View style={StyleSheet.absoluteFill}>
+          <View style={{ flex: 1, backgroundColor: 'rgba(0, 31, 63, 0.82)' }} />
+        </View>
+
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          keyboardVerticalOffset={Platform.OS === 'ios' ? 10 : 0}
         >
-          {/* Back Button */}
-          <TouchableOpacity
-            onPress={() => router.replace('/(auth)/login')}
-            style={{
-              position: 'absolute',
-              top: Platform.OS === 'ios' ? 60 : 40,
-              left: 24,
-              zIndex: 10,
-              backgroundColor: 'rgba(255, 255, 255, 0.2)',
-              borderRadius: 12,
-              padding: 12,
+          <ScrollView
+            contentContainerStyle={{
+              flexGrow: 1,
+              paddingHorizontal: 24,
+              paddingTop: Platform.OS === 'ios' ? 56 : 36,
+              paddingBottom: 48,
+              justifyContent: 'center',
             }}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            showsVerticalScrollIndicator={false}
           >
-            <Ionicons name="arrow-back" size={24} color="#fff" />
-          </TouchableOpacity>
-
-          <View style={{ alignItems: 'center', marginBottom: 48 }}>
-            <Image
-              source={require('../../assets/logo.png')}
-              style={{ width: 200, height: 80, resizeMode: 'contain', marginBottom: 16 }}
-            />
-            <Text style={{ fontSize: 18, color: 'rgba(255,255,255,0.9)', fontWeight: '500', textAlign: 'center' }}>
-              Attendance Management System
-            </Text>
-          </View>
-
-          <View style={[Styles.card, { padding: 32 }]}>
-            <View style={{ alignItems: 'center', marginBottom: 24 }}>
-              <View
-                style={{
-                  width: 64,
-                  height: 64,
-                  borderRadius: 32,
-                  backgroundColor: Colors.light.primary + '20',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  marginBottom: 16,
-                }}
+            {/* Header / Back */}
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
+              <TouchableOpacity
+                onPress={() => router.replace('/(auth)/login')}
+                style={styles.backButton}
+                activeOpacity={0.7}
               >
-                <Ionicons name="key-outline" size={32} color={Colors.light.primary} />
-              </View>
-              <Text style={[Styles.title, { textAlign: 'center' }]}>Reset Password</Text>
-              <Text style={[Styles.subtitle, { textAlign: 'center', marginTop: 8 }]}>
-                Enter your new password below.
-              </Text>
+                <MaterialCommunityIcons name="arrow-left" size={20} color="#ffffff" />
+                <Text style={{ color: '#ffffff', fontWeight: '700', fontSize: 14, marginLeft: 6 }}>Sign In</Text>
+              </TouchableOpacity>
+              <Image
+                source={require('../../assets/logo.png')}
+                style={{ width: 140, height: 55, resizeMode: 'contain' }}
+              />
             </View>
 
-            <View style={Styles.inputGroup}>
-              <Text style={Styles.label}>New Password</Text>
-              <View style={{ position: 'relative' }}>
-                <TextInput
-                  style={[Styles.input, { paddingRight: 48 }]}
-                  placeholder="Min. 8 characters"
-                  placeholderTextColor={Colors.light.textLight}
-                  secureTextEntry={!showPassword}
-                  value={password}
-                  onChangeText={setPassword}
-                />
-                <TouchableOpacity
-                  onPress={() => setShowPassword(!showPassword)}
-                  style={{
-                    position: 'absolute',
-                    right: 12,
-                    top: 0,
-                    bottom: 0,
-                    justifyContent: 'center',
-                  }}
-                >
-                  <Ionicons
-                    name={showPassword ? 'eye-off-outline' : 'eye-outline'}
-                    size={20}
-                    color={Colors.light.textLight}
+            {/* Card */}
+            <View style={styles.glassCard}>
+              <View style={{ alignItems: 'center', marginBottom: 20 }}>
+                <View style={styles.iconCircle}>
+                  <MaterialCommunityIcons name="shield-key-outline" size={36} color="#001f3f" />
+                </View>
+                <Text style={styles.cardTitle}>Set New Password</Text>
+                <Text style={styles.cardSubtitle}>
+                  Choose a secure password with at least 8 characters.
+                </Text>
+              </View>
+
+              {/* New Password */}
+              <View style={{ marginBottom: 16 }}>
+                <Text style={styles.inputLabel}>NEW PASSWORD</Text>
+                <View style={styles.inputWrapper}>
+                  <MaterialCommunityIcons name="lock-outline" size={20} color="#0077b6" style={{ marginRight: 10 }} />
+                  <TextInput
+                    style={styles.textInputField}
+                    placeholder="At least 8 characters"
+                    placeholderTextColor="rgba(0, 31, 63, 0.35)"
+                    secureTextEntry={!showPassword}
+                    value={password}
+                    onChangeText={setPassword}
                   />
-                </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => setShowPassword(!showPassword)}
+                    style={{ padding: 4 }}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <MaterialCommunityIcons
+                      name={showPassword ? 'eye-off-outline' : 'eye-outline'}
+                      size={20}
+                      color="#718096"
+                    />
+                  </TouchableOpacity>
+                </View>
               </View>
-            </View>
 
-            <View style={Styles.inputGroup}>
-              <Text style={Styles.label}>Confirm Password</Text>
-              <View style={{ position: 'relative' }}>
-                <TextInput
-                  style={[Styles.input, { paddingRight: 48 }]}
-                  placeholder="Re-enter password"
-                  placeholderTextColor={Colors.light.textLight}
-                  secureTextEntry={!showConfirmPassword}
-                  value={confirmPassword}
-                  onChangeText={setConfirmPassword}
-                />
-                <TouchableOpacity
-                  onPress={() => setShowConfirmPassword(!showConfirmPassword)}
-                  style={{
-                    position: 'absolute',
-                    right: 12,
-                    top: 0,
-                    bottom: 0,
-                    justifyContent: 'center',
-                  }}
-                >
-                  <Ionicons
-                    name={showConfirmPassword ? 'eye-off-outline' : 'eye-outline'}
-                    size={20}
-                    color={Colors.light.textLight}
+              {/* Confirm Password */}
+              <View style={{ marginBottom: 20 }}>
+                <Text style={styles.inputLabel}>CONFIRM NEW PASSWORD</Text>
+                <View style={styles.inputWrapper}>
+                  <MaterialCommunityIcons name="lock-check-outline" size={20} color="#0077b6" style={{ marginRight: 10 }} />
+                  <TextInput
+                    style={styles.textInputField}
+                    placeholder="Repeat new password"
+                    placeholderTextColor="rgba(0, 31, 63, 0.35)"
+                    secureTextEntry={!showConfirmPassword}
+                    value={confirmPassword}
+                    onChangeText={setConfirmPassword}
                   />
-                </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => setShowConfirmPassword(!showConfirmPassword)}
+                    style={{ padding: 4 }}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <MaterialCommunityIcons
+                      name={showConfirmPassword ? 'eye-off-outline' : 'eye-outline'}
+                      size={20}
+                      color="#718096"
+                    />
+                  </TouchableOpacity>
+                </View>
               </View>
-            </View>
 
-            <TouchableOpacity
-              style={[Styles.btnPrimary, { marginTop: 16 }]}
-              onPress={handleResetPassword}
-              disabled={loading}
-            >
-              {loading ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={Styles.btnPrimaryText}>Reset Password</Text>
-              )}
-            </TouchableOpacity>
-
-            <View style={{ marginTop: 24, alignItems: 'center' }}>
-              <TouchableOpacity onPress={() => router.replace('/(auth)/login')}>
-                <Text style={{ color: Colors.light.primary, fontWeight: '700', fontSize: 16 }}>Back to Sign In</Text>
+              {/* Submit */}
+              <TouchableOpacity
+                style={[styles.primaryButton, loading && { opacity: 0.75 }]}
+                onPress={handleResetPassword}
+                disabled={loading}
+                activeOpacity={0.88}
+              >
+                {loading ? (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <ActivityIndicator color="#ffffff" size="small" />
+                    <Text style={styles.primaryButtonText}>Updating Password...</Text>
+                  </View>
+                ) : (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <Text style={styles.primaryButtonText}>Save New Password</Text>
+                    <MaterialCommunityIcons name="check" size={18} color="#ffffff" />
+                  </View>
+                )}
               </TouchableOpacity>
             </View>
-          </View>
-        </ScrollView>
-      </KeyboardAvoidingView>
-    </ImageBackground>
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </ImageBackground>
+    </TouchableWithoutFeedback>
   );
 }
+
+const styles = StyleSheet.create({
+  glassCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 28,
+    padding: 28,
+    shadowColor: '#001f3f',
+    shadowOffset: { width: 0, height: 16 },
+    shadowOpacity: 0.25,
+    shadowRadius: 24,
+    elevation: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.9)',
+  },
+  iconCircle: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: 'rgba(0, 119, 182, 0.1)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+  },
+  cardTitle: {
+    fontSize: 22,
+    fontWeight: '900',
+    color: '#001f3f',
+    letterSpacing: -0.5,
+    marginBottom: 6,
+    textAlign: 'center',
+  },
+  cardSubtitle: {
+    fontSize: 13,
+    color: '#718096',
+    fontWeight: '500',
+    textAlign: 'center',
+    lineHeight: 19,
+    paddingHorizontal: 12,
+  },
+  inputLabel: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#4a5568',
+    letterSpacing: 0.8,
+    marginBottom: 6,
+  },
+  inputWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f8fafc',
+    borderWidth: 1.5,
+    borderColor: '#e2e8f0',
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    height: 52,
+  },
+  textInputField: {
+    flex: 1,
+    fontSize: 15,
+    color: '#001f3f',
+    fontWeight: '600',
+  },
+  primaryButton: {
+    backgroundColor: '#001f3f',
+    borderRadius: 18,
+    height: 54,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#001f3f',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.25,
+    shadowRadius: 12,
+    elevation: 4,
+  },
+  primaryButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+  backButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+  },
+});

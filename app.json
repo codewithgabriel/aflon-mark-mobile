@@ -20,7 +20,7 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "softwareKeyboardLayoutMode": "pan",
+      "softwareKeyboardLayoutMode": "resize",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
     },
@@ -33,7 +33,9 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "AflonMark needs camera access to scan attendance QR codes."
+          "cameraPermission": "AflonMark needs camera access to scan attendance QR codes.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
         }
       ],
       [
@@ -47,7 +49,11 @@
             "backgroundColor": "#001f3f"
           }
         }
-      ]
+      ],
+      "expo-font",
+      "expo-image",
+      "expo-status-bar",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true

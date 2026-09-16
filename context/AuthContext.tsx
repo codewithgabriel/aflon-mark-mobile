@@ -33,10 +33,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const segments = useSegments();
   const router = useRouter();
 
-  useEffect(() => {
-    loadUser();
-  }, []);
-
   const loadUser = async () => {
     try {
       const storedUser = await AsyncStorage.getItem('aflon_user');
@@ -49,6 +45,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setIsLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadUser();
+  }, []);
 
   useEffect(() => {
     if (isLoading) return;

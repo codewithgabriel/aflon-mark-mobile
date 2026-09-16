@@ -1,12 +1,23 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  Animated, FlatList, ScrollView,
-  StyleSheet, Text, TouchableOpacity, View,
+  Animated,
+  FlatList,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from 'react-native';
-import { Colors } from '../../constants/Colors';
 import { useAuth } from '../../context/AuthContext';
 import { fetchAPI } from '../../utils/api';
+import {
+  getCachedHistory,
+  getPendingOfflineScans,
+  setCachedHistory,
+  syncOfflineQueue,
+} from '../../utils/offlineSync';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type AttendanceRecord = {
@@ -15,6 +26,8 @@ type AttendanceRecord = {
   checkInTime: string;
   checkOutTime: string | null;
   status: 'Early' | 'OnTime' | 'Present' | 'Late' | 'Absent';
+  isOfflinePending?: boolean;
+  action?: 'IN' | 'OUT';
 };
 
 type MonthlySummary = {
@@ -43,20 +56,23 @@ const fmtMonth = (m: string) => {
 const duration = (checkIn: string, checkOut: string | null) => {
   if (!checkOut) return null;
   const mins = Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 60000);
+  if (mins < 0) return null;
   const h = Math.floor(mins / 60);
   const m = mins % 60;
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
 
-// ── Skeleton ──────────────────────────────────────────────────────────────────
+// ── Skeleton Loader ───────────────────────────────────────────────────────────
 function SkeletonCard() {
-  const opacity = useRef(new Animated.Value(0.3)).current;
+  const [opacity] = useState(() => new Animated.Value(0.25));
   useEffect(() => {
-    Animated.loop(Animated.sequence([
-      Animated.timing(opacity, { toValue: 0.7, duration: 700, useNativeDriver: true }),
-      Animated.timing(opacity, { toValue: 0.3, duration: 700, useNativeDriver: true }),
-    ])).start();
-  }, []);
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(opacity, { toValue: 0.65, duration: 700, useNativeDriver: true }),
+        Animated.timing(opacity, { toValue: 0.25, duration: 700, useNativeDriver: true }),
+      ])
+    ).start();
+  }, [opacity]);
   return (
     <Animated.View style={[styles.card, { opacity }]}>
       <View style={styles.skeletonDate} />
@@ -68,22 +84,24 @@ function SkeletonCard() {
   );
 }
 
-// ── Pulse dot ─────────────────────────────────────────────────────────────────
+// ── Pulse Dot for Active Session ──────────────────────────────────────────────
 function PulseDot() {
-  const scale = useRef(new Animated.Value(1)).current;
-  const opacity = useRef(new Animated.Value(1)).current;
+  const [scale] = useState(() => new Animated.Value(1));
+  const [opacity] = useState(() => new Animated.Value(1));
   useEffect(() => {
-    Animated.loop(Animated.parallel([
-      Animated.sequence([
-        Animated.timing(scale,   { toValue: 1.6, duration: 800, useNativeDriver: true }),
-        Animated.timing(scale,   { toValue: 1,   duration: 800, useNativeDriver: true }),
-      ]),
-      Animated.sequence([
-        Animated.timing(opacity, { toValue: 0.2, duration: 800, useNativeDriver: true }),
-        Animated.timing(opacity, { toValue: 1,   duration: 800, useNativeDriver: true }),
-      ]),
-    ])).start();
-  }, []);
+    Animated.loop(
+      Animated.parallel([
+        Animated.sequence([
+          Animated.timing(scale, { toValue: 1.6, duration: 800, useNativeDriver: true }),
+          Animated.timing(scale, { toValue: 1, duration: 800, useNativeDriver: true }),
+        ]),
+        Animated.sequence([
+          Animated.timing(opacity, { toValue: 0.2, duration: 800, useNativeDriver: true }),
+          Animated.timing(opacity, { toValue: 1, duration: 800, useNativeDriver: true }),
+        ]),
+      ])
+    ).start();
+  }, [scale, opacity]);
   return (
     <View style={styles.pulseWrapper}>
       <Animated.View style={[styles.pulseDot, { transform: [{ scale }], opacity }]} />
@@ -92,13 +110,19 @@ function PulseDot() {
   );
 }
 
-// ── Monthly summary card ──────────────────────────────────────────────────────
+// ── Monthly Summary Card ──────────────────────────────────────────────────────
 function MonthlySummaryCard({ summary }: { summary: MonthlySummary }) {
   const totalH = summary.totalHours;
   const totalM = summary.totalMinutes;
   return (
     <View style={styles.summaryCard}>
-      <Text style={styles.summaryMonth}>{fmtMonth(summary.month)}</Text>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <Text style={styles.summaryMonth}>{fmtMonth(summary.month)}</Text>
+        <View style={styles.summaryBadge}>
+          <Text style={styles.summaryBadgeText}>Monthly Overview</Text>
+        </View>
+      </View>
+
       <View style={styles.summaryGrid}>
         <View style={styles.summaryItem}>
           <Text style={styles.summaryValue}>{summary.activeDays}</Text>
@@ -106,42 +130,50 @@ function MonthlySummaryCard({ summary }: { summary: MonthlySummary }) {
         </View>
         <View style={styles.summaryDivider} />
         <View style={styles.summaryItem}>
-          <Text style={[styles.summaryValue, { color: '#48bb78' }]}>{summary.presentDays}</Text>
+          <Text style={[styles.summaryValue, { color: '#10b981' }]}>{summary.presentDays}</Text>
           <Text style={styles.summaryLabel}>On Time</Text>
         </View>
         <View style={styles.summaryDivider} />
         <View style={styles.summaryItem}>
-          <Text style={[styles.summaryValue, { color: '#ecc94b' }]}>{summary.lateDays}</Text>
+          <Text style={[styles.summaryValue, { color: '#f59e0b' }]}>{summary.lateDays}</Text>
           <Text style={styles.summaryLabel}>Late</Text>
         </View>
         <View style={styles.summaryDivider} />
         <View style={styles.summaryItem}>
-          <Text style={styles.summaryValue}>
-            {totalH > 0 ? `${totalH}h` : ''}{totalM > 0 ? ` ${totalM}m` : totalH === 0 ? '—' : ''}
+          <Text style={[styles.summaryValue, { color: '#60a5fa' }]}>
+            {totalH > 0 ? `${totalH}h` : ''}{totalM > 0 ? ` ${totalM}m` : totalH === 0 ? '0h' : ''}
           </Text>
-          <Text style={styles.summaryLabel}>Total Hours</Text>
+          <Text style={styles.summaryLabel}>Hours</Text>
         </View>
       </View>
     </View>
   );
 }
 
-// ── Log card ──────────────────────────────────────────────────────────────────
+// ── Log Card Component ────────────────────────────────────────────────────────
 function LogCard({ item }: { item: AttendanceRecord }) {
   const dur = duration(item.checkInTime, item.checkOutTime);
-  const statusConfig = {
-    Early:   { bg: 'rgba(56,161,105,0.18)',  text: '#48bb78', label: 'Early'   },
-    OnTime:  { bg: 'rgba(59,130,246,0.18)',  text: '#60a5fa', label: 'On Time' },
-    Present: { bg: 'rgba(56,161,105,0.18)',  text: '#48bb78', label: 'On Time' },
-    Late:    { bg: 'rgba(214,158,46,0.18)',  text: '#ecc94b', label: 'Late'    },
-    Absent:  { bg: 'rgba(229,62,62,0.18)',   text: '#fc8181', label: 'Absent'  },
-  }[item.status] ?? { bg: 'rgba(255,255,255,0.1)', text: 'white', label: item.status };
+
+  const statusConfig = item.isOfflinePending
+    ? { bg: 'rgba(245, 158, 11, 0.2)', text: '#fbbf24', label: 'Offline • Pending Sync' }
+    : {
+        Early: { bg: 'rgba(16, 185, 129, 0.18)', text: '#34d399', label: 'Early' },
+        OnTime: { bg: 'rgba(59, 130, 246, 0.18)', text: '#60a5fa', label: 'On Time' },
+        Present: { bg: 'rgba(16, 185, 129, 0.18)', text: '#34d399', label: 'On Time' },
+        Late: { bg: 'rgba(245, 158, 11, 0.18)', text: '#fbbf24', label: 'Late' },
+        Absent: { bg: 'rgba(239, 68, 68, 0.18)', text: '#f87171', label: 'Absent' },
+      }[item.status] ?? { bg: 'rgba(255, 255, 255, 0.1)', text: 'white', label: item.status };
 
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, item.isOfflinePending && styles.offlineCardBorder]}>
       {/* Header */}
       <View style={styles.cardHeader}>
-        <Text style={styles.dateText}>{fmtDate(item.date)}</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          {item.isOfflinePending && (
+            <MaterialCommunityIcons name="cloud-clock-outline" size={16} color="#fbbf24" />
+          )}
+          <Text style={styles.dateText}>{fmtDate(item.date)}</Text>
+        </View>
         <View style={[styles.badge, { backgroundColor: statusConfig.bg }]}>
           <Text style={[styles.badgeText, { color: statusConfig.text }]}>{statusConfig.label}</Text>
         </View>
@@ -152,10 +184,10 @@ function LogCard({ item }: { item: AttendanceRecord }) {
       {/* Times */}
       <View style={styles.timesRow}>
         <View style={styles.timeItem}>
-          <MaterialCommunityIcons name="clock-check-outline" size={15} color="#48bb78" />
+          <MaterialCommunityIcons name="clock-check-outline" size={16} color="#34d399" />
           <View style={styles.timeTexts}>
             <Text style={styles.timeLabel}>Check-in</Text>
-            <Text style={[styles.timeValue, { color: '#48bb78' }]}>{fmtTime(item.checkInTime)}</Text>
+            <Text style={[styles.timeValue, { color: '#34d399' }]}>{fmtTime(item.checkInTime)}</Text>
           </View>
         </View>
 
@@ -164,7 +196,7 @@ function LogCard({ item }: { item: AttendanceRecord }) {
         <View style={styles.timeItem}>
           {item.checkOutTime ? (
             <>
-              <MaterialCommunityIcons name="clock-out" size={15} color="#60a5fa" />
+              <MaterialCommunityIcons name="clock-out" size={16} color="#60a5fa" />
               <View style={styles.timeTexts}>
                 <Text style={styles.timeLabel}>Check-out</Text>
                 <Text style={[styles.timeValue, { color: '#60a5fa' }]}>{fmtTime(item.checkOutTime)}</Text>
@@ -175,7 +207,7 @@ function LogCard({ item }: { item: AttendanceRecord }) {
               <PulseDot />
               <View style={styles.timeTexts}>
                 <Text style={styles.timeLabel}>Check-out</Text>
-                <Text style={[styles.timeValue, { color: Colors.light.accent }]}>Active</Text>
+                <Text style={[styles.timeValue, { color: '#00e5ff' }]}>Active</Text>
               </View>
             </>
           )}
@@ -185,10 +217,10 @@ function LogCard({ item }: { item: AttendanceRecord }) {
           <>
             <View style={styles.timesDivider} />
             <View style={styles.timeItem}>
-              <MaterialCommunityIcons name="timer-outline" size={15} color="rgba(255,255,255,0.5)" />
+              <MaterialCommunityIcons name="timer-outline" size={16} color="rgba(255,255,255,0.4)" />
               <View style={styles.timeTexts}>
                 <Text style={styles.timeLabel}>Duration</Text>
-                <Text style={[styles.timeValue, { color: 'rgba(255,255,255,0.8)' }]}>{dur}</Text>
+                <Text style={[styles.timeValue, { color: 'rgba(255,255,255,0.85)' }]}>{dur}</Text>
               </View>
             </View>
           </>
@@ -198,21 +230,38 @@ function LogCard({ item }: { item: AttendanceRecord }) {
   );
 }
 
-// ── Month picker ──────────────────────────────────────────────────────────────
-function MonthPicker({ months, selected, onSelect }: { months: string[]; selected: string; onSelect: (m: string) => void }) {
+// ── Month Picker ──────────────────────────────────────────────────────────────
+function MonthPicker({
+  months,
+  selected,
+  onSelect,
+}: {
+  months: string[];
+  selected: string;
+  onSelect: (m: string) => void;
+}) {
   return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.monthPicker} contentContainerStyle={{ paddingHorizontal: 16, gap: 8 }}>
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      style={styles.monthPicker}
+      contentContainerStyle={{ paddingHorizontal: 16, gap: 8, paddingVertical: 12 }}
+    >
       <TouchableOpacity
         style={[styles.monthChip, selected === 'all' && styles.monthChipActive]}
         onPress={() => onSelect('all')}
+        activeOpacity={0.8}
       >
-        <Text style={[styles.monthChipText, selected === 'all' && styles.monthChipTextActive]}>All</Text>
+        <Text style={[styles.monthChipText, selected === 'all' && styles.monthChipTextActive]}>
+          All Months
+        </Text>
       </TouchableOpacity>
-      {months.map(m => (
+      {months.map((m) => (
         <TouchableOpacity
           key={m}
           style={[styles.monthChip, selected === m && styles.monthChipActive]}
           onPress={() => onSelect(m)}
+          activeOpacity={0.8}
         >
           <Text style={[styles.monthChipText, selected === m && styles.monthChipTextActive]}>
             {fmtMonth(m)}
@@ -223,56 +272,112 @@ function MonthPicker({ months, selected, onSelect }: { months: string[]; selecte
   );
 }
 
-// ── Empty state ───────────────────────────────────────────────────────────────
+// ── Empty State ───────────────────────────────────────────────────────────────
 function EmptyState() {
   return (
     <View style={styles.emptyContainer}>
       <View style={styles.emptyIconRing}>
-        <MaterialCommunityIcons name="calendar-blank-outline" size={44} color="rgba(255,255,255,0.2)" />
+        <MaterialCommunityIcons name="calendar-blank-outline" size={48} color="rgba(255,255,255,0.2)" />
       </View>
-      <Text style={styles.emptyTitle}>No records yet</Text>
-      <Text style={styles.emptySubtitle}>Your attendance history will appear here once you start checking in.</Text>
+      <Text style={styles.emptyTitle}>No Attendance Records</Text>
+      <Text style={styles.emptySubtitle}>
+        Your check-in history will appear here once you start scanning at the campus stations.
+      </Text>
     </View>
   );
 }
 
-// ── Main screen ───────────────────────────────────────────────────────────────
+// ── Main Screen ───────────────────────────────────────────────────────────────
 export default function HistoryScreen() {
   const { user } = useAuth();
-  const [records, setRecords]           = useState<AttendanceRecord[]>([]);
+  const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [monthlySummary, setMonthlySummary] = useState<MonthlySummary[]>([]);
-  const [loading, setLoading]           = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [selectedMonth, setSelectedMonth] = useState<string>('all');
 
-  useEffect(() => { fetchHistory(); }, []);
-
   const fetchHistory = async () => {
+    // 1. Check local cache first for instant display
+    const cached = await getCachedHistory();
+    if (cached && cached.length > 0 && records.length === 0) {
+      setRecords(cached);
+      setLoading(false);
+    }
+
     try {
+      // 2. Fetch from backend
       const data = await fetchAPI(`/attendance/history?userId=${user?._id}`);
-      setRecords(data.records ?? []);
-      setMonthlySummary(data.monthlySummary ?? []);
+      const serverRecords: AttendanceRecord[] = data.records ?? (Array.isArray(data) ? data : []);
+      const summaries: MonthlySummary[] = data.monthlySummary ?? [];
+
+      // 3. Merge pending offline scans that may not be on the server yet
+      const pendingQueue = await getPendingOfflineScans();
+      const userPending = pendingQueue.filter((q) => q.userId === user?._id);
+
+      const mergedRecords: AttendanceRecord[] = [...serverRecords];
+
+      // Add any pending offline scan if it doesn't already exist on server for that date
+      for (const pending of userPending) {
+        const alreadyExists = mergedRecords.some((r) => r.date === pending.date);
+        if (!alreadyExists) {
+          mergedRecords.unshift({
+            _id: pending.id,
+            date: pending.date,
+            checkInTime: pending.timestamp,
+            checkOutTime: pending.action === 'OUT' ? pending.timestamp : null,
+            status: 'Present',
+            isOfflinePending: true,
+            action: pending.action,
+          });
+        }
+      }
+
+      setRecords(mergedRecords);
+      setMonthlySummary(summaries);
+      await setCachedHistory(mergedRecords);
     } catch (err) {
-      console.error(err);
+      // Offline fallback: load cached
+      console.warn('Unable to load history from server, using cached records.', err);
+      const cachedRecords = await getCachedHistory();
+      if (cachedRecords && cachedRecords.length > 0) {
+        setRecords(cachedRecords);
+      }
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
 
-  const months = monthlySummary.map(s => s.month);
+  useEffect(() => {
+    fetchHistory();
+  }, []);
 
-  const filteredRecords = selectedMonth === 'all'
-    ? records
-    : records.filter(r => r.date.startsWith(selectedMonth));
+  const onRefresh = async () => {
+    setRefreshing(true);
+    // Sync any pending scans first
+    await syncOfflineQueue().catch(() => {});
+    await fetchHistory();
+  };
 
-  const activeSummary = selectedMonth === 'all'
-    ? null
-    : monthlySummary.find(s => s.month === selectedMonth) ?? null;
+  const months = monthlySummary.map((s) => s.month);
+
+  const filteredRecords =
+    selectedMonth === 'all'
+      ? records
+      : records.filter((r) => r.date.startsWith(selectedMonth));
+
+  const activeSummary =
+    selectedMonth === 'all'
+      ? null
+      : monthlySummary.find((s) => s.month === selectedMonth) ?? null;
 
   if (loading) {
     return (
       <View style={styles.container}>
         <View style={styles.listContent}>
-          {[1, 2, 3, 4].map(k => <SkeletonCard key={k} />)}
+          {[1, 2, 3, 4].map((k) => (
+            <SkeletonCard key={k} />
+          ))}
         </View>
       </View>
     );
@@ -280,94 +385,285 @@ export default function HistoryScreen() {
 
   return (
     <View style={styles.container}>
-      {/* Month filter */}
+      {/* Month Filter Chips */}
       {months.length > 0 && (
         <MonthPicker months={months} selected={selectedMonth} onSelect={setSelectedMonth} />
       )}
 
       <FlatList
         data={filteredRecords}
-        keyExtractor={item => item._id}
+        keyExtractor={(item) => item._id}
         renderItem={({ item }) => <LogCard item={item} />}
-        contentContainerStyle={[styles.listContent, filteredRecords.length === 0 && styles.listEmpty]}
-        ListHeaderComponent={activeSummary ? <MonthlySummaryCard summary={activeSummary} /> : null}
+        contentContainerStyle={[
+          styles.listContent,
+          filteredRecords.length === 0 && styles.listEmpty,
+        ]}
+        ListHeaderComponent={
+          activeSummary ? <MonthlySummaryCard summary={activeSummary} /> : null
+        }
         ListEmptyComponent={<EmptyState />}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor="#00e5ff"
+            colors={['#00e5ff']}
+          />
+        }
         showsVerticalScrollIndicator={false}
       />
     </View>
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
-  container:   { flex: 1, backgroundColor: Colors.light.primaryDark },
-  listContent: { padding: 16, paddingBottom: 32 },
-  listEmpty:   { flex: 1, justifyContent: 'center' },
+  container: {
+    flex: 1,
+    backgroundColor: '#001f3f',
+  },
+  listContent: {
+    padding: 16,
+    paddingBottom: 32,
+    gap: 12,
+  },
+  listEmpty: {
+    flexGrow: 1,
+    justifyContent: 'center',
+  },
 
-  // Month picker
-  monthPicker: { maxHeight: 48, marginTop: 12 },
+  // Month Chips
+  monthPicker: {
+    flexGrow: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.25)',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)',
+  },
   monthChip: {
-    paddingHorizontal: 14, paddingVertical: 7,
-    borderRadius: 20, borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.15)',
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    paddingVertical: 7,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
   },
-  monthChipActive: { backgroundColor: Colors.light.accent, borderColor: Colors.light.accent },
-  monthChipText: { fontSize: 12, fontWeight: '600', color: 'rgba(255,255,255,0.55)' },
-  monthChipTextActive: { color: '#001f3f' },
+  monthChipActive: {
+    backgroundColor: '#00e5ff',
+    borderColor: '#00e5ff',
+    shadowColor: '#00e5ff',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  monthChipText: {
+    color: 'rgba(255, 255, 255, 0.65)',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  monthChipTextActive: {
+    color: '#001f3f',
+    fontWeight: '900',
+  },
 
-  // Monthly summary
+  // Monthly Summary Card
   summaryCard: {
-    backgroundColor: 'rgba(255,255,255,0.08)',
-    borderRadius: 16, borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    padding: 16, marginBottom: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.14)',
+    padding: 18,
+    marginBottom: 8,
   },
-  summaryMonth: { fontSize: 14, fontWeight: '700', color: 'white', marginBottom: 14 },
-  summaryGrid:  { flexDirection: 'row', alignItems: 'center' },
-  summaryItem:  { flex: 1, alignItems: 'center' },
-  summaryValue: { fontSize: 20, fontWeight: '800', color: 'white' },
-  summaryLabel: { fontSize: 10, color: 'rgba(255,255,255,0.4)', fontWeight: '600', marginTop: 2, textTransform: 'uppercase' },
-  summaryDivider: { width: 1, height: 36, backgroundColor: 'rgba(255,255,255,0.1)' },
+  summaryMonth: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: -0.3,
+  },
+  summaryBadge: {
+    backgroundColor: 'rgba(0, 229, 255, 0.15)',
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+  },
+  summaryBadgeText: {
+    color: '#00e5ff',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+  summaryGrid: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.2)',
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+  },
+  summaryItem: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  summaryValue: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: '900',
+    marginBottom: 2,
+  },
+  summaryLabel: {
+    color: 'rgba(255, 255, 255, 0.45)',
+    fontSize: 10,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  summaryDivider: {
+    width: 1,
+    height: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
 
-  // Log card
+  // Card
   card: {
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderRadius: 16, borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.1)',
-    padding: 16, marginBottom: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    padding: 16,
   },
-  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  dateText:   { fontSize: 14, fontWeight: '700', color: 'white', flex: 1, marginRight: 8 },
-  divider:    { height: 1, backgroundColor: 'rgba(255,255,255,0.08)', marginBottom: 12 },
-  timesRow:   { flexDirection: 'row', alignItems: 'center' },
-  timeItem:   { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 7 },
-  timeTexts:  { gap: 2 },
-  timeLabel:  { fontSize: 10, color: 'rgba(255,255,255,0.4)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.4 },
-  timeValue:  { fontSize: 13, fontWeight: '700' },
-  timesDivider: { width: 1, height: 30, backgroundColor: 'rgba(255,255,255,0.08)', marginHorizontal: 10 },
-  badge:      { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 },
-  badgeText:  { fontSize: 11, fontWeight: '800', letterSpacing: 0.5 },
+  offlineCardBorder: {
+    borderColor: 'rgba(245, 158, 11, 0.4)',
+    backgroundColor: 'rgba(245, 158, 11, 0.05)',
+  },
+  cardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  dateText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  badge: {
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+  },
+  badgeText: {
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    marginBottom: 12,
+  },
+  timesRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  timeItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flex: 1,
+  },
+  timeTexts: {
+    flexDirection: 'column',
+  },
+  timeLabel: {
+    color: 'rgba(255, 255, 255, 0.4)',
+    fontSize: 10,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  timeValue: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  timesDivider: {
+    width: 1,
+    height: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    marginHorizontal: 8,
+  },
 
-  // Pulse dot
-  pulseWrapper: { width: 15, height: 15, justifyContent: 'center', alignItems: 'center' },
-  pulseDot:     { position: 'absolute', width: 13, height: 13, borderRadius: 7, backgroundColor: Colors.light.accent },
-  pulseDotCore: { width: 7, height: 7, borderRadius: 4, backgroundColor: Colors.light.accent },
+  // Pulse Dot
+  pulseWrapper: {
+    width: 16,
+    height: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  pulseDot: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#00e5ff',
+  },
+  pulseDotCore: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#00e5ff',
+  },
 
   // Skeleton
-  skeletonDate:  { height: 13, width: '55%', backgroundColor: 'rgba(255,255,255,0.12)', borderRadius: 6, marginBottom: 12 },
-  skeletonRow:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  skeletonLine:  { height: 11, width: '40%', backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 6 },
-  skeletonBadge: { height: 20, width: 56, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 20 },
-
-  // Empty
-  emptyContainer: { alignItems: 'center', paddingHorizontal: 40 },
-  emptyIconRing: {
-    width: 96, height: 96, borderRadius: 48,
-    backgroundColor: 'rgba(255,255,255,0.05)',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)',
-    justifyContent: 'center', alignItems: 'center', marginBottom: 20,
+  skeletonDate: {
+    width: 120,
+    height: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 8,
+    marginBottom: 14,
   },
-  emptyTitle:    { fontSize: 18, fontWeight: '700', color: 'rgba(255,255,255,0.7)', marginBottom: 8 },
-  emptySubtitle: { fontSize: 13, color: 'rgba(255,255,255,0.35)', textAlign: 'center', lineHeight: 20 },
+  skeletonRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  skeletonLine: {
+    width: '60%',
+    height: 14,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 7,
+  },
+  skeletonBadge: {
+    width: 60,
+    height: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 10,
+  },
+
+  // Empty State
+  emptyContainer: {
+    alignItems: 'center',
+    padding: 32,
+  },
+  emptyIconRing: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  emptyTitle: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+  emptySubtitle: {
+    color: 'rgba(255, 255, 255, 0.45)',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 19,
+    paddingHorizontal: 24,
+  },
 });
