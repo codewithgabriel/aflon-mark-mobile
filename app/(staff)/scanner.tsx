@@ -623,7 +623,7 @@ export default function ScannerScreen() {
     const blocked = !modeAvailability.allowed && !isComplete;
 
     return (
-      <View style={styles.container}>
+      <View style={styles.idleContainer}>
         {renderQueueSheet()}
         {renderTopBar()}
 
@@ -651,7 +651,14 @@ export default function ScannerScreen() {
           </View>
         </View>
 
-        <View style={styles.idleContent}>
+        {/* The body is centred in whatever room is left below the chrome above,
+            and scrolls instead of clipping on short screens. */}
+        <ScrollView
+          style={styles.idleScroll}
+          contentContainerStyle={styles.idleScrollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.idleContent}>
           <View style={styles.idleIconGlow}>
             <View style={styles.idleIconRing}>
               <MaterialCommunityIcons name="qrcode-scan" size={56} color="#00e5ff" />
@@ -729,7 +736,8 @@ export default function ScannerScreen() {
               {isComplete ? 'Completed For Today' : 'Start Camera Scan'}
             </Text>
           </TouchableOpacity>
-        </View>
+          </View>
+        </ScrollView>
       </View>
     );
   }
@@ -834,16 +842,33 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
 
+  // Idle screen. Unlike `container` this does not centre its children: the top
+  // chrome sits in normal flow and the body centres itself in what is left, so
+  // adding a row to the schedule card can no longer shove the icon up under the
+  // mode selector.
+  idleContainer: {
+    flex: 1,
+    backgroundColor: '#001f3f',
+  },
+  idleScroll: {
+    flex: 1,
+    width: '100%',
+  },
+  idleScrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingTop: 12,
+    paddingBottom: 24,
+  },
+
   // Top Status Bar
   topBar: {
-    position: 'absolute',
-    top: 50,
-    left: 20,
-    right: 20,
-    zIndex: 20,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    zIndex: 20,
   },
   networkBadge: {
     flexDirection: 'row',
@@ -895,10 +920,8 @@ const styles = StyleSheet.create({
 
   // Mode Selector
   modeSelector: {
-    position: 'absolute',
-    top: 96,
-    left: 24,
-    right: 24,
+    paddingHorizontal: 24,
+    marginTop: 14,
     zIndex: 10,
   },
   modeContainer: {
@@ -939,7 +962,6 @@ const styles = StyleSheet.create({
   idleContent: {
     alignItems: 'center',
     paddingHorizontal: 28,
-    marginTop: 80,
     width: '100%',
   },
   idleIconGlow: {

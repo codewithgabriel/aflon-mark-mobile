@@ -69,7 +69,16 @@ export const fetchAPI = async (endpoint: string, options: any = {}) => {
   try {
     response = await fetch(url, { ...options, headers });
   } catch (networkError: any) {
-    console.error(`[Network Error] ${endpoint}:`, networkError?.message);
+    // Being offline is a supported state, and the connectivity probe aborts on
+    // purpose after its timeout — neither is a fault worth a red error log.
+    const aborted =
+      options.signal?.aborted ||
+      networkError?.name === 'AbortError' ||
+      /cancel/i.test(networkError?.message || '');
+
+    if (!aborted) {
+      console.warn(`[Offline] ${endpoint}: ${networkError?.message ?? 'request failed'}`);
+    }
     throw new APIError('Network error — check your connection.', 0);
   }
 
