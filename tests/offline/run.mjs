@@ -13,7 +13,7 @@
  * Run with: npm run test:offline
  */
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,7 +42,20 @@ try {
   // emit still happens, and a genuine failure surfaces as a missing module below.
 }
 
-cpSync(join(here, 'stubs'), work, { recursive: true });
+// ./api → a fetch whose reply each test sets.
+cpSync(join(here, 'stubs', 'api.js'), join(work, 'api.js'));
+
+// AsyncStorage → an in-memory map. It has to sit at the real package's
+// resolution path, which cannot be committed under tests/ because node_modules
+// is gitignored — so the module directory is assembled here instead.
+const storagePkg = join(work, 'node_modules', '@react-native-async-storage', 'async-storage');
+mkdirSync(storagePkg, { recursive: true });
+cpSync(join(here, 'stubs', 'async-storage.js'), join(storagePkg, 'index.js'));
+writeFileSync(
+  join(storagePkg, 'package.json'),
+  JSON.stringify({ name: '@react-native-async-storage/async-storage', version: '0.0.0', main: 'index.js' })
+);
+
 cpSync(join(here, 'offlineSync.test.js'), join(work, 'offlineSync.test.js'));
 
 try {
