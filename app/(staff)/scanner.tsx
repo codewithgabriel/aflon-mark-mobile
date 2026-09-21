@@ -1,9 +1,11 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Haptics from 'expo-haptics';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Modal,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -12,17 +14,28 @@ import {
 import { useAuth } from '../../context/AuthContext';
 import { APIError, fetchAPI } from '../../utils/api';
 import {
+  CachedTodayStatus,
+  FailedScan,
+  QueuedScan,
+  Schedule,
   checkServerConnectivity,
+  clearSyncFailures,
+  discardQueuedScan,
   enqueueOfflineScan,
+  evaluateScanLocally,
+  getCachedSchedule,
   getCachedTodayStatus,
   getPendingOfflineScans,
+  getSyncFailures,
   getTodayDateString,
+  refreshSchedule,
+  resolveDaySchedule,
   setCachedTodayStatus,
   syncOfflineQueue,
 } from '../../utils/offlineSync';
 
 type ScanState = 'idle' | 'scanning' | 'loading' | 'success' | 'error';
-type StatusState = 'loading' | 'none' | 'checkedIn' | 'complete' | 'error';
+type StatusState = 'loading' | 'none' | 'checkedIn' | 'complete';
 
 type AttendanceRecord = {
   _id: string;
@@ -33,192 +46,555 @@ type AttendanceRecord = {
   status: 'Early' | 'OnTime' | 'Present' | 'Late' | 'Absent';
 };
 
-type AttendanceTimes = {
-  checkInEnd: string;
-  checkInClose: string;
-  checkOutStart: string;
-  checkOutEnd: string;
-  fridayCheckOutStart: string;
-  fridayCheckOutEnd: string;
+const CONNECTIVITY_POLL_MS = 20000;
+
+const formatClock = (iso?: string | null): string => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+};
+
+const STATUS_COPY: Record<string, string> = {
+  Early: 'Early',
+  OnTime: 'On Time',
+  Late: 'Late',
 };
 
 export default function ScannerScreen() {
   const [permission, requestPermission] = useCameraPermissions();
-  const [scanState, setScanState] = useState<ScanState>('idle');
-  const [statusState, setStatusState] = useState<StatusState>('loading');
-  const [checkInTime, setCheckInTime] = useState<string | null>(null);
-  const [resultMessage, setResultMessage] = useState('');
-  const [isOfflineResult, setIsOfflineResult] = useState(false);
-  const [mode, setMode] = useState<'IN' | 'OUT'>('IN');
-  const [times, setTimes] = useState<AttendanceTimes>({
-    checkInEnd: '09:00', checkInClose: '11:00',
-    checkOutStart: '15:00', checkOutEnd: '20:00',
-    fridayCheckOutStart: '', fridayCheckOutEnd: '',
-  });
-
-  // Offline sync & connectivity state
-  const [isOnline, setIsOnline] = useState(true);
-  const [pendingCount, setPendingCount] = useState(0);
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [isOfflinePendingToday, setIsOfflinePendingToday] = useState(false);
-
   const { user } = useAuth();
 
-  const formatTime = (isoString: string): string => {
-    const d = new Date(isoString);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
-  };
+  const [scanState, setScanState] = useState<ScanState>('idle');
+  const [statusState, setStatusState] = useState<StatusState>('loading');
+  const [todayStatus, setTodayStatus] = useState<CachedTodayStatus | null>(null);
+  const [mode, setMode] = useState<'IN' | 'OUT'>('IN');
 
-  // Update pending offline items count
-  const refreshPendingCount = async () => {
-    const queue = await getPendingOfflineScans();
-    setPendingCount(queue.length);
-  };
+  const [resultMessage, setResultMessage] = useState('');
+  const [resultDetail, setResultDetail] = useState('');
+  const [isOfflineResult, setIsOfflineResult] = useState(false);
 
-  // Check connectivity and trigger sync if back online
-  const checkConnectivity = async () => {
+  const [schedule, setSchedule] = useState<Schedule | null>(null);
+  const [isOnline, setIsOnline] = useState(true);
+  const [queue, setQueue] = useState<QueuedScan[]>([]);
+  const [failures, setFailures] = useState<FailedScan[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [showQueueSheet, setShowQueueSheet] = useState(false);
+
+  // Guards against overlapping syncs kicked off by the poller and by a scan.
+  const syncingRef = useRef(false);
+
+  const today = resolveDaySchedule(schedule, new Date());
+
+  /* ── Queue state ─────────────────────────────────────────────────────── */
+
+  const refreshQueueState = useCallback(async () => {
+    const [pending, failed] = await Promise.all([getPendingOfflineScans(), getSyncFailures()]);
+    setQueue(pending);
+    setFailures(failed);
+    return pending;
+  }, []);
+
+  /* ── Today's status ──────────────────────────────────────────────────── */
+
+  const applyStatus = useCallback((status: CachedTodayStatus | null) => {
+    setTodayStatus(status);
+    if (!status || status.status === 'none') {
+      setStatusState('none');
+      setMode('IN');
+      return;
+    }
+    setStatusState(status.status === 'complete' ? 'complete' : 'checkedIn');
+    // Once checked in, the only remaining action is checking out.
+    setMode('OUT');
+  }, []);
+
+  /**
+   * Today's state is the server's record, with any still-queued offline scans
+   * layered on top — otherwise a device that checked in offline would show
+   * "not checked in" the moment it regained signal but before it synced.
+   */
+  const userId = user?._id;
+
+  const fetchTodayStatus = useCallback(async () => {
+    const date = getTodayDateString();
+    const cached = await getCachedTodayStatus();
+    if (cached) applyStatus(cached);
+    else setStatusState('none');
+
+    const pending = await refreshQueueState();
+    const pendingToday = pending.filter((q) => q.date === date);
+
+    let serverStatus: CachedTodayStatus | null = null;
+
+    try {
+      const res = await fetchAPI(`/attendance/history?userId=${userId}`);
+      const list: AttendanceRecord[] = Array.isArray(res) ? res : res?.records || [];
+      const record = list.find((r) => r.date === date) ?? null;
+      setIsOnline(true);
+
+      if (record) {
+        serverStatus = {
+          date,
+          checkInTime: record.checkInTime,
+          checkOutTime: record.checkOutTime,
+          status: record.checkOutTime ? 'complete' : 'checkedIn',
+          isOfflinePending: false,
+          localStatus: (STATUS_COPY[record.status] ? record.status : undefined) as any,
+        };
+      } else {
+        serverStatus = { date, checkInTime: null, checkOutTime: null, status: 'none' };
+      }
+    } catch {
+      setIsOnline(false);
+      // No server answer — the cache is the best truth we have.
+      if (cached) return;
+      if (pendingToday.length === 0) {
+        applyStatus({ date, checkInTime: null, checkOutTime: null, status: 'none' });
+        await setCachedTodayStatus({ date, checkInTime: null, checkOutTime: null, status: 'none' });
+      }
+      return;
+    }
+
+    // Overlay anything still waiting to be sent.
+    const merged: CachedTodayStatus = { ...serverStatus };
+    for (const item of pendingToday) {
+      if (item.action === 'IN' && !merged.checkInTime) merged.checkInTime = item.timestamp;
+      if (item.action === 'OUT' && !merged.checkOutTime) merged.checkOutTime = item.timestamp;
+    }
+    merged.isOfflinePending = pendingToday.length > 0;
+    merged.status = merged.checkOutTime ? 'complete' : merged.checkInTime ? 'checkedIn' : 'none';
+    merged.localStatus = merged.localStatus ?? cached?.localStatus;
+
+    applyStatus(merged);
+    await setCachedTodayStatus(merged);
+  }, [applyStatus, refreshQueueState, userId]);
+
+  /* ── Sync ────────────────────────────────────────────────────────────── */
+
+  const runSync = useCallback(
+    async ({ silent = false }: { silent?: boolean } = {}) => {
+      if (syncingRef.current) return;
+      syncingRef.current = true;
+      if (!silent) setIsSyncing(true);
+
+      try {
+        const outcome = await syncOfflineQueue();
+        if (outcome.syncedCount > 0) {
+          try {
+            await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          } catch {}
+        }
+        await refreshQueueState();
+        await fetchTodayStatus();
+        return outcome;
+      } catch (e) {
+        console.error('Sync failed', e);
+      } finally {
+        syncingRef.current = false;
+        setIsSyncing(false);
+      }
+    },
+    [fetchTodayStatus, refreshQueueState]
+  );
+
+  const checkConnectivity = useCallback(async () => {
     const online = await checkServerConnectivity();
     setIsOnline(online);
 
     if (online) {
-      const queue = await getPendingOfflineScans();
-      if (queue.length > 0 && !isSyncing) {
-        handleTriggerSync();
-      }
+      const cachedSchedule = await getCachedSchedule();
+      if (cachedSchedule) setSchedule(cachedSchedule);
+      const pending = await refreshQueueState();
+      if (pending.length > 0) runSync({ silent: true });
     }
-  };
+  }, [refreshQueueState, runSync]);
 
-  const handleTriggerSync = async () => {
-    if (isSyncing) return;
-    setIsSyncing(true);
-    try {
-      const { syncedCount } = await syncOfflineQueue();
-      if (syncedCount > 0) {
-        try {
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        } catch {}
-      }
-      await refreshPendingCount();
-      await fetchTodayStatus();
-    } catch (e) {
-      console.error('Manual sync failed', e);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  const fetchTodayStatus = async () => {
-    setStatusState('loading');
-    const today = getTodayDateString();
-
-    // Check cached today status first for instant display
-    const cachedToday = await getCachedTodayStatus();
-    if (cachedToday && cachedToday.date === today) {
-      if (cachedToday.status === 'checkedIn' && cachedToday.checkInTime) {
-        setCheckInTime(formatTime(cachedToday.checkInTime));
-        setStatusState('checkedIn');
-        setMode('OUT');
-        setIsOfflinePendingToday(!!cachedToday.isOfflinePending);
-      } else if (cachedToday.status === 'complete') {
-        setStatusState('complete');
-        setIsOfflinePendingToday(!!cachedToday.isOfflinePending);
-      }
-    }
-
-    try {
-      const res = await fetchAPI(`/attendance/history?userId=${user?._id}`);
-      const list: AttendanceRecord[] = Array.isArray(res) ? res : (res?.records || []);
-      const record = list.find((r) => r.date === today) ?? null;
-
-      if (!record) {
-        // If not on server, but we have a pending offline check-in today, keep offline state
-        if (cachedToday?.status === 'checkedIn' && cachedToday.isOfflinePending) {
-          setStatusState('checkedIn');
-          setMode('OUT');
-          setIsOfflinePendingToday(true);
-        } else if (cachedToday?.status === 'complete' && cachedToday.isOfflinePending) {
-          setStatusState('complete');
-          setIsOfflinePendingToday(true);
-        } else {
-          setStatusState('none');
-          setIsOfflinePendingToday(false);
-          await setCachedTodayStatus({
-            date: today,
-            checkInTime: null,
-            checkOutTime: null,
-            status: 'none',
-          });
-        }
-      } else if (record.checkInTime && !record.checkOutTime) {
-        setStatusState('checkedIn');
-        setCheckInTime(formatTime(record.checkInTime));
-        setMode('OUT');
-        setIsOfflinePendingToday(false);
-        await setCachedTodayStatus({
-          date: today,
-          checkInTime: record.checkInTime,
-          checkOutTime: null,
-          status: 'checkedIn',
-          isOfflinePending: false,
-        });
-      } else if (record.checkInTime && record.checkOutTime) {
-        setStatusState('complete');
-        setIsOfflinePendingToday(false);
-        await setCachedTodayStatus({
-          date: today,
-          checkInTime: record.checkInTime,
-          checkOutTime: record.checkOutTime,
-          status: 'complete',
-          isOfflinePending: false,
-        });
-      }
-    } catch {
-      // Offline fallback: rely on local cache if server is unreachable
-      if (cachedToday && cachedToday.date === today) {
-        if (cachedToday.status === 'checkedIn') {
-          setStatusState('checkedIn');
-          setCheckInTime(formatTime(cachedToday.checkInTime || new Date().toISOString()));
-          setMode('OUT');
-          setIsOfflinePendingToday(!!cachedToday.isOfflinePending);
-        } else if (cachedToday.status === 'complete') {
-          setStatusState('complete');
-          setIsOfflinePendingToday(!!cachedToday.isOfflinePending);
-        } else {
-          setStatusState('none');
-        }
-      } else {
-        setStatusState('none');
-      }
-    }
-  };
+  /* ── Bootstrap ───────────────────────────────────────────────────────── */
 
   useEffect(() => {
-    fetchAPI('/settings')
-      .then((data: AttendanceTimes) => {
-        setTimes(data);
-        setIsOnline(true);
-      })
-      .catch(() => {
-        setIsOnline(false);
-      });
+    let cancelled = false;
 
-    refreshPendingCount();
+    (async () => {
+      // Show the last known schedule instantly, then refresh it.
+      const cached = await getCachedSchedule();
+      if (cached && !cancelled) setSchedule(cached);
 
-    // Check connectivity every 20 seconds
-    const interval = setInterval(() => {
-      checkConnectivity();
-      refreshPendingCount();
-    }, 20000);
+      try {
+        const fresh = await refreshSchedule();
+        if (!cancelled) {
+          setSchedule(fresh);
+          setIsOnline(true);
+        }
+      } catch {
+        if (!cancelled) setIsOnline(false);
+      }
 
-    return () => clearInterval(interval);
+      if (!cancelled) await refreshQueueState();
+    })();
+
+    const interval = setInterval(checkConnectivity, CONNECTIVITY_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (scanState === 'idle') {
-      fetchTodayStatus();
-      refreshPendingCount();
-    }
+    if (scanState === 'idle') fetchTodayStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanState]);
+
+  /* ── Scanning ────────────────────────────────────────────────────────── */
+
+  const showError = useCallback(async (message: string, detail = '') => {
+    try {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } catch {}
+    setResultMessage(message);
+    setResultDetail(detail);
+    setIsOfflineResult(false);
+    setScanState('error');
+  }, []);
+
+  const handleBarcodeScanned = async ({ data }: { type: string; data: string }) => {
+    if (scanState !== 'scanning') return; // the camera can fire repeatedly
+    setScanState('loading');
+    setIsOfflineResult(false);
+    setResultDetail('');
+
+    if (data !== 'static-wall-qr') {
+      await showError('Invalid QR code. Please scan the official Aflon station code.');
+      return;
+    }
+
+    if (!user?._id) {
+      await showError('Your session has expired. Please sign in again.');
+      return;
+    }
+
+    const capturedAt = new Date();
+
+    try {
+      const response = await fetchAPI('/attendance/scan', {
+        method: 'POST',
+        body: JSON.stringify({ userId: user._id, locationToken: data, action: mode }),
+      });
+
+      try {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } catch {}
+
+      setIsOnline(true);
+      setResultMessage(response?.message || 'Attendance recorded successfully.');
+      setResultDetail(
+        response?.time ? `${mode === 'IN' ? 'Checked in' : 'Checked out'} at ${formatClock(response.time)}` : ''
+      );
+      setScanState('success');
+
+      // Opportunistically drain anything queued from an earlier outage.
+      runSync({ silent: true });
+      return;
+    } catch (err: any) {
+      const status: number = err instanceof APIError ? err.status : -1;
+      const unreachable = status === 0 || status === -1 || status >= 500;
+
+      if (!unreachable) {
+        // The server answered and said no — show its reason as-is.
+        setIsOnline(true);
+        await showError(err?.message || 'Unable to record attendance.');
+        return;
+      }
+
+      setIsOnline(false);
+
+      // ── Offline path ──
+      // Apply the same rules the server would, so the staff member gets a
+      // straight answer now instead of a silent rejection at sync time.
+      const cachedSchedule = schedule || (await getCachedSchedule());
+      const currentStatus = await getCachedTodayStatus();
+      const decision = evaluateScanLocally({
+        action: mode,
+        schedule: cachedSchedule,
+        todayStatus: currentStatus,
+        when: capturedAt,
+      });
+
+      if (!decision.allowed) {
+        await showError(
+          decision.reason || 'This scan cannot be recorded right now.',
+          'You are offline. This check was made against the schedule last synced to this device.'
+        );
+        return;
+      }
+
+      try {
+        await enqueueOfflineScan({
+          userId: user._id,
+          locationToken: data,
+          action: mode,
+          localStatus: decision.status,
+          when: capturedAt,
+        });
+
+        try {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        } catch {}
+
+        setIsOfflineResult(true);
+        setResultMessage(
+          `${mode === 'IN' ? 'Check-in' : 'Check-out'} saved offline at ${formatClock(capturedAt.toISOString())}.`
+        );
+        setResultDetail(
+          decision.status
+            ? `Recorded as ${STATUS_COPY[decision.status]} for ${decision.day.dayLabel}.`
+            : `Recorded for ${decision.day.dayLabel}.`
+        );
+        setScanState('success');
+        await refreshQueueState();
+      } catch (queueErr) {
+        console.error('Failed to queue offline scan', queueErr);
+        await showError('Could not save this scan on your device. Please try again.');
+      }
+    }
+  };
+
+  const reset = () => {
+    setResultMessage('');
+    setResultDetail('');
+    setIsOfflineResult(false);
+    setScanState('idle');
+  };
+
+  /* ── Derived UI state ────────────────────────────────────────────────── */
+
+  const isComplete = statusState === 'complete';
+  const pendingCount = queue.length;
+  const hasIssues = failures.length > 0;
+
+  const modeAvailability = useMemo(() => {
+    const decision = evaluateScanLocally({
+      action: mode,
+      schedule,
+      todayStatus,
+      when: new Date(),
+    });
+    return decision;
+    // Re-evaluated whenever the inputs change; a minute-level refresh is not
+    // needed because the server re-checks anyway when online.
+  }, [mode, schedule, todayStatus]);
+
+  /* ── Offline queue sheet ─────────────────────────────────────────────── */
+
+  const renderQueueSheet = () => (
+    <Modal
+      visible={showQueueSheet}
+      animationType="slide"
+      transparent
+      onRequestClose={() => setShowQueueSheet(false)}
+    >
+      <View style={styles.sheetBackdrop}>
+        <View style={styles.sheet}>
+          <View style={styles.sheetHandle} />
+
+          <View style={styles.sheetHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.sheetTitle}>Offline Records</Text>
+              <Text style={styles.sheetSubtitle}>
+                {pendingCount > 0
+                  ? `${pendingCount} scan${pendingCount > 1 ? 's' : ''} waiting to reach the server`
+                  : 'Everything on this device has been synced'}
+              </Text>
+            </View>
+            <TouchableOpacity onPress={() => setShowQueueSheet(false)} style={styles.sheetClose}>
+              <MaterialCommunityIcons name="close" size={20} color="rgba(255,255,255,0.7)" />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={styles.sheetScroll} contentContainerStyle={{ paddingBottom: 12 }}>
+            {pendingCount === 0 && !hasIssues && (
+              <View style={styles.sheetEmpty}>
+                <MaterialCommunityIcons name="cloud-check-outline" size={44} color="rgba(16,185,129,0.6)" />
+                <Text style={styles.sheetEmptyText}>Nothing pending. You&apos;re all caught up.</Text>
+              </View>
+            )}
+
+            {queue.map((item) => (
+              <View key={item.id} style={styles.queueRow}>
+                <View
+                  style={[
+                    styles.queueIcon,
+                    { backgroundColor: item.action === 'IN' ? 'rgba(16,185,129,0.18)' : 'rgba(96,165,250,0.18)' },
+                  ]}
+                >
+                  <MaterialCommunityIcons
+                    name={item.action === 'IN' ? 'login' : 'logout'}
+                    size={16}
+                    color={item.action === 'IN' ? '#10b981' : '#60a5fa'}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.queueTitle}>
+                    {item.action === 'IN' ? 'Check-in' : 'Check-out'} · {formatClock(item.timestamp)}
+                  </Text>
+                  <Text style={styles.queueMeta}>
+                    {item.date}
+                    {item.attempts > 0 ? ` · ${item.attempts} attempt${item.attempts > 1 ? 's' : ''}` : ''}
+                  </Text>
+                  {!!item.lastError && <Text style={styles.queueError}>{item.lastError}</Text>}
+                </View>
+                <TouchableOpacity
+                  onPress={async () => {
+                    await discardQueuedScan(item.id);
+                    await refreshQueueState();
+                  }}
+                  style={styles.queueDiscard}
+                >
+                  <Text style={styles.queueDiscardText}>Discard</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+
+            {hasIssues && (
+              <>
+                <View style={styles.sheetDivider}>
+                  <Text style={styles.sheetDividerText}>Rejected by the server</Text>
+                </View>
+                {failures.map((item) => (
+                  <View key={item.id} style={[styles.queueRow, styles.queueRowFailed]}>
+                    <View style={[styles.queueIcon, { backgroundColor: 'rgba(239,68,68,0.18)' }]}>
+                      <MaterialCommunityIcons name="alert-circle-outline" size={16} color="#ef4444" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.queueTitle}>
+                        {item.action === 'IN' ? 'Check-in' : 'Check-out'} · {formatClock(item.timestamp)}
+                      </Text>
+                      <Text style={styles.queueMeta}>{item.date}</Text>
+                      <Text style={styles.queueError}>{item.reason}</Text>
+                    </View>
+                  </View>
+                ))}
+                <TouchableOpacity
+                  onPress={async () => {
+                    await clearSyncFailures();
+                    await refreshQueueState();
+                  }}
+                  style={styles.sheetGhostBtn}
+                >
+                  <Text style={styles.sheetGhostBtnText}>Dismiss rejected records</Text>
+                </TouchableOpacity>
+                <Text style={styles.sheetNote}>
+                  These scans fell outside the allowed window. Speak to an administrator if the record needs to be
+                  added manually.
+                </Text>
+              </>
+            )}
+          </ScrollView>
+
+          {pendingCount > 0 && (
+            <TouchableOpacity
+              style={[styles.sheetPrimaryBtn, (!isOnline || isSyncing) && { opacity: 0.45 }]}
+              onPress={() => runSync()}
+              disabled={!isOnline || isSyncing}
+              activeOpacity={0.88}
+            >
+              {isSyncing ? (
+                <ActivityIndicator size="small" color="#001f3f" />
+              ) : (
+                <MaterialCommunityIcons name="cloud-upload-outline" size={18} color="#001f3f" />
+              )}
+              <Text style={styles.sheetPrimaryBtnText}>
+                {isSyncing ? 'Syncing…' : isOnline ? 'Sync now' : 'Waiting for connection'}
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+
+  const renderTopBar = () => (
+    <View style={styles.topBar}>
+      <View style={[styles.networkBadge, isOnline ? styles.badgeOnline : styles.badgeOffline]}>
+        <View style={[styles.networkDot, { backgroundColor: isOnline ? '#10b981' : '#f59e0b' }]} />
+        <Text style={styles.networkBadgeText}>{isOnline ? 'Online' : 'Offline Mode'}</Text>
+      </View>
+
+      {(pendingCount > 0 || hasIssues) && (
+        <TouchableOpacity
+          style={[styles.pendingSyncButton, hasIssues && pendingCount === 0 && styles.pendingSyncButtonAlert]}
+          onPress={() => setShowQueueSheet(true)}
+          activeOpacity={0.85}
+        >
+          {isSyncing ? (
+            <ActivityIndicator size="small" color="#001f3f" />
+          ) : (
+            <MaterialCommunityIcons
+              name={hasIssues && pendingCount === 0 ? 'alert-circle-outline' : 'cloud-upload-outline'}
+              size={15}
+              color="#001f3f"
+            />
+          )}
+          <Text style={styles.pendingSyncText}>
+            {isSyncing
+              ? 'Syncing…'
+              : pendingCount > 0
+              ? `${pendingCount} queued`
+              : `${failures.length} rejected`}
+          </Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+
+  const renderStatusIndicator = () => {
+    if (statusState === 'loading') return <ActivityIndicator size="small" color="rgba(255,255,255,0.6)" />;
+
+    if (statusState === 'none') {
+      return (
+        <View style={styles.statusPill}>
+          <View style={[styles.statusDot, { backgroundColor: '#94a3b8' }]} />
+          <Text style={styles.statusNone}>Not checked in yet today</Text>
+        </View>
+      );
+    }
+
+    if (statusState === 'checkedIn') {
+      return (
+        <View
+          style={[
+            styles.statusPill,
+            { borderColor: 'rgba(16, 185, 129, 0.3)', backgroundColor: 'rgba(16, 185, 129, 0.12)' },
+          ]}
+        >
+          <View style={[styles.statusDot, { backgroundColor: '#10b981' }]} />
+          <Text style={styles.statusIn}>
+            Checked in at {formatClock(todayStatus?.checkInTime)}
+            {todayStatus?.localStatus ? ` · ${STATUS_COPY[todayStatus.localStatus]}` : ''}
+            {todayStatus?.isOfflinePending ? ' · pending sync' : ''}
+          </Text>
+        </View>
+      );
+    }
+
+    return (
+      <View
+        style={[
+          styles.statusPill,
+          { borderColor: 'rgba(96, 165, 250, 0.3)', backgroundColor: 'rgba(96, 165, 250, 0.12)' },
+        ]}
+      >
+        <View style={[styles.statusDot, { backgroundColor: '#60a5fa' }]} />
+        <Text style={styles.statusComplete}>
+          {formatClock(todayStatus?.checkInTime)} → {formatClock(todayStatus?.checkOutTime)}
+          {todayStatus?.isOfflinePending ? ' · pending sync' : ''}
+        </Text>
+      </View>
+    );
+  };
+
+  /* ── Permission gate ─────────────────────────────────────────────────── */
 
   if (!permission) return <View style={styles.container} />;
 
@@ -241,177 +617,40 @@ export default function ScannerScreen() {
     );
   }
 
-  const handleBarcodeScanned = async ({ data }: { type: string; data: string }) => {
-    setScanState('loading');
-    setIsOfflineResult(false);
+  /* ── IDLE ────────────────────────────────────────────────────────────── */
 
-    try {
-      // Validate location token
-      if (data !== 'static-wall-qr') {
-        throw new Error('Invalid QR code. Please scan the official Aflon station code.');
-      }
-
-      // Try sending to the backend
-      const response = await fetchAPI('/attendance/scan', {
-        method: 'POST',
-        body: JSON.stringify({ userId: user?._id, locationToken: data, action: mode }),
-      });
-
-      try {
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      } catch {}
-
-      setResultMessage(response.message || 'Attendance recorded successfully.');
-      setScanState('success');
-
-      // Also trigger sync for any other pending offline records
-      syncOfflineQueue().catch(() => {});
-    } catch (err: any) {
-      // Check if this is a network error (no connection, server unreachable)
-      const isNetworkError = (err instanceof APIError && err.status === 0) || !isOnline;
-
-      if (isNetworkError && user?._id) {
-        // Record offline!
-        try {
-          await enqueueOfflineScan({
-            userId: user._id,
-            locationToken: data,
-            action: mode,
-          });
-
-          try {
-            await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          } catch {}
-
-          setIsOfflineResult(true);
-          setResultMessage(
-            `${mode === 'IN' ? 'Check-In' : 'Check-Out'} recorded offline!\nIt is securely saved on this device and will automatically submit once internet is restored.`
-          );
-          setScanState('success');
-          await refreshPendingCount();
-          return;
-        } catch (queueErr) {
-          console.error('Failed to queue offline scan', queueErr);
-        }
-      }
-
-      // Other API errors (e.g. "Check-out window has closed", "You are already checked in")
-      try {
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      } catch {}
-
-      setResultMessage(err.message || 'Unable to record attendance.');
-      setScanState('error');
-    }
-  };
-
-  const reset = () => {
-    setResultMessage('');
-    setIsOfflineResult(false);
-    setScanState('idle');
-  };
-
-  const startScan = () => setScanState('scanning');
-
-  const isComplete = statusState === 'complete';
-
-  const renderStatusIndicator = () => {
-    if (statusState === 'loading') return <ActivityIndicator size="small" color="rgba(255,255,255,0.6)" />;
-    if (statusState === 'none') {
-      return (
-        <View style={styles.statusPill}>
-          <View style={[styles.statusDot, { backgroundColor: '#94a3b8' }]} />
-          <Text style={styles.statusNone}>Not checked in yet today</Text>
-        </View>
-      );
-    }
-    if (statusState === 'checkedIn') {
-      return (
-        <View style={[styles.statusPill, { borderColor: 'rgba(16, 185, 129, 0.3)', backgroundColor: 'rgba(16, 185, 129, 0.12)' }]}>
-          <View style={[styles.statusDot, { backgroundColor: '#10b981' }]} />
-          <Text style={styles.statusIn}>
-            Checked in at {checkInTime || 'today'}
-            {isOfflinePendingToday ? ' (Offline • Pending Sync)' : ''}
-          </Text>
-        </View>
-      );
-    }
-    if (statusState === 'complete') {
-      return (
-        <View style={[styles.statusPill, { borderColor: 'rgba(96, 165, 250, 0.3)', backgroundColor: 'rgba(96, 165, 250, 0.12)' }]}>
-          <View style={[styles.statusDot, { backgroundColor: '#60a5fa' }]} />
-          <Text style={styles.statusComplete}>Attendance complete for today</Text>
-        </View>
-      );
-    }
-    return null;
-  };
-
-  // ── IDLE SCREEN ──────────────────────────────────────────────────────────
   if (scanState === 'idle') {
+    const blocked = !modeAvailability.allowed && !isComplete;
+
     return (
       <View style={styles.container}>
-        {/* Top Connectivity & Sync Bar */}
-        <View style={styles.topBar}>
-          <View style={[styles.networkBadge, isOnline ? styles.badgeOnline : styles.badgeOffline]}>
-            <View style={[styles.networkDot, { backgroundColor: isOnline ? '#10b981' : '#f59e0b' }]} />
-            <Text style={styles.networkBadgeText}>
-              {isOnline ? 'Online' : 'Offline Mode'}
-            </Text>
-          </View>
-
-          {pendingCount > 0 && (
-            <TouchableOpacity
-              style={styles.pendingSyncButton}
-              onPress={handleTriggerSync}
-              disabled={isSyncing || !isOnline}
-              activeOpacity={0.8}
-            >
-              {isSyncing ? (
-                <ActivityIndicator size="small" color="#001f3f" />
-              ) : (
-                <MaterialCommunityIcons name="cloud-upload-outline" size={15} color="#001f3f" />
-              )}
-              <Text style={styles.pendingSyncText}>
-                {isSyncing ? 'Syncing...' : `${pendingCount} Queued • Sync Now`}
-              </Text>
-            </TouchableOpacity>
-          )}
-        </View>
+        {renderQueueSheet()}
+        {renderTopBar()}
 
         {/* Mode Selector */}
         <View style={styles.modeSelector}>
           <View style={styles.modeContainer}>
-            <TouchableOpacity
-              style={[styles.modeButton, mode === 'IN' && styles.modeActive]}
-              onPress={() => setMode('IN')}
-              activeOpacity={0.8}
-            >
-              <MaterialCommunityIcons
-                name="login"
-                size={16}
-                color={mode === 'IN' ? '#001f3f' : 'rgba(255,255,255,0.4)'}
-                style={{ marginRight: 6 }}
-              />
-              <Text style={[styles.modeText, mode === 'IN' && styles.modeTextActive]}>CHECK IN</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.modeButton, mode === 'OUT' && styles.modeActive]}
-              onPress={() => setMode('OUT')}
-              activeOpacity={0.8}
-            >
-              <MaterialCommunityIcons
-                name="logout"
-                size={16}
-                color={mode === 'OUT' ? '#001f3f' : 'rgba(255,255,255,0.4)'}
-                style={{ marginRight: 6 }}
-              />
-              <Text style={[styles.modeText, mode === 'OUT' && styles.modeTextActive]}>CHECK OUT</Text>
-            </TouchableOpacity>
+            {(['IN', 'OUT'] as const).map((m) => (
+              <TouchableOpacity
+                key={m}
+                style={[styles.modeButton, mode === m && styles.modeActive]}
+                onPress={() => setMode(m)}
+                activeOpacity={0.8}
+              >
+                <MaterialCommunityIcons
+                  name={m === 'IN' ? 'login' : 'logout'}
+                  size={16}
+                  color={mode === m ? '#001f3f' : 'rgba(255,255,255,0.4)'}
+                  style={{ marginRight: 6 }}
+                />
+                <Text style={[styles.modeText, mode === m && styles.modeTextActive]}>
+                  {m === 'IN' ? 'CHECK IN' : 'CHECK OUT'}
+                </Text>
+              </TouchableOpacity>
+            ))}
           </View>
         </View>
 
-        {/* Main Idle Content */}
         <View style={styles.idleContent}>
           <View style={styles.idleIconGlow}>
             <View style={styles.idleIconRing}>
@@ -419,51 +658,69 @@ export default function ScannerScreen() {
             </View>
           </View>
 
-          <Text style={styles.idleTitle}>
-            Ready to {mode === 'IN' ? 'Check In' : 'Check Out'}
-          </Text>
+          <Text style={styles.idleTitle}>Ready to {mode === 'IN' ? 'Check In' : 'Check Out'}</Text>
           <Text style={styles.idleSubtitle}>
-            Scan the Aflon wall station QR code. Works seamlessly online and offline!
+            Scan the Aflon wall station QR code. Works the same whether or not you have signal.
           </Text>
 
-          {/* Time Window Details Card */}
+          {/* Today's schedule */}
           <View style={styles.timeCard}>
-            <View style={styles.timeRow}>
-              <View style={styles.timeIconWrapIn}>
-                <MaterialCommunityIcons name="arrow-down-bold" size={14} color="#10b981" />
-              </View>
-              <Text style={styles.timeLabel}>Check-In</Text>
-              <Text style={styles.timeValue}>
-                On-time before {times.checkInEnd} <Text style={styles.timeSub}>(closes {times.checkInClose})</Text>
-              </Text>
+            <View style={styles.timeCardHeader}>
+              <Text style={styles.timeCardHeaderText}>{today.dayLabel} schedule</Text>
+              {today.mode === 'custom' && today.working && (
+                <View style={styles.customBadge}>
+                  <Text style={styles.customBadgeText}>CUSTOM</Text>
+                </View>
+              )}
+              {!today.working && (
+                <View style={styles.offBadge}>
+                  <Text style={styles.offBadgeText}>NON-WORKING</Text>
+                </View>
+              )}
             </View>
-            <View style={[styles.timeRow, { marginTop: 10 }]}>
-              <View style={styles.timeIconWrapOut}>
-                <MaterialCommunityIcons name="arrow-up-bold" size={14} color="#60a5fa" />
-              </View>
-              <Text style={styles.timeLabel}>Check-Out</Text>
-              {(() => {
-                const isFriday = new Date().getDay() === 5;
-                const useFriday = isFriday && times.fridayCheckOutStart && times.fridayCheckOutEnd;
-                const start = useFriday ? times.fridayCheckOutStart : times.checkOutStart;
-                const end = useFriday ? times.fridayCheckOutEnd : times.checkOutEnd;
-                return (
+
+            {today.working ? (
+              <>
+                <View style={styles.timeRow}>
+                  <View style={styles.timeIconWrapIn}>
+                    <MaterialCommunityIcons name="arrow-down-bold" size={14} color="#10b981" />
+                  </View>
+                  <Text style={styles.timeLabel}>Check-In</Text>
                   <Text style={styles.timeValue}>
-                    {start} – {end}
-                    {useFriday ? <Text style={styles.timeSub}> (Friday Schedule)</Text> : null}
+                    On time before {today.checkInEnd}{' '}
+                    <Text style={styles.timeSub}>(closes {today.checkInClose})</Text>
                   </Text>
-                );
-              })()}
-            </View>
+                </View>
+                <View style={[styles.timeRow, { marginTop: 10 }]}>
+                  <View style={styles.timeIconWrapOut}>
+                    <MaterialCommunityIcons name="arrow-up-bold" size={14} color="#60a5fa" />
+                  </View>
+                  <Text style={styles.timeLabel}>Check-Out</Text>
+                  <Text style={styles.timeValue}>
+                    {today.checkOutStart} – {today.checkOutEnd}
+                  </Text>
+                </View>
+              </>
+            ) : (
+              <Text style={styles.timeValue}>
+                Today is not a scheduled working day. Attendance is still recorded if you come in, and no
+                absence is counted.
+              </Text>
+            )}
           </View>
 
-          {/* Current Day Status Pill */}
           <View style={styles.statusRow}>{renderStatusIndicator()}</View>
 
-          {/* Action Button */}
+          {blocked && (
+            <View style={styles.blockedNotice}>
+              <MaterialCommunityIcons name="clock-alert-outline" size={15} color="#fbbf24" />
+              <Text style={styles.blockedNoticeText}>{modeAvailability.reason}</Text>
+            </View>
+          )}
+
           <TouchableOpacity
             style={[styles.scanBtn, isComplete && { opacity: 0.4 }]}
-            onPress={isComplete ? undefined : startScan}
+            onPress={isComplete ? undefined : () => setScanState('scanning')}
             disabled={isComplete}
             activeOpacity={0.88}
           >
@@ -477,7 +734,8 @@ export default function ScannerScreen() {
     );
   }
 
-  // ── CAMERA SCANNING SCREEN ────────────────────────────────────────────────
+  /* ── SCANNING ────────────────────────────────────────────────────────── */
+
   if (scanState === 'scanning') {
     return (
       <View style={styles.container}>
@@ -488,7 +746,6 @@ export default function ScannerScreen() {
           barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
         />
         <View style={styles.overlay}>
-          {/* Top mode indicator */}
           <View style={styles.scanHeader}>
             <View style={styles.scanModePill}>
               <Text style={styles.scanModeText}>
@@ -497,7 +754,6 @@ export default function ScannerScreen() {
             </View>
           </View>
 
-          {/* Target Scan Box with Brackets */}
           <View style={styles.targetFrame}>
             <View style={[styles.corner, styles.topLeft]} />
             <View style={[styles.corner, styles.topRight]} />
@@ -515,70 +771,48 @@ export default function ScannerScreen() {
     );
   }
 
-  // ── LOADING / PROCESSING ──────────────────────────────────────────────────
+  /* ── LOADING ─────────────────────────────────────────────────────────── */
+
   if (scanState === 'loading') {
     return (
       <View style={styles.container}>
         <View style={styles.loadingCard}>
           <ActivityIndicator size="large" color="#00e5ff" />
           <Text style={styles.loadingTitle}>Processing Attendance</Text>
-          <Text style={styles.loadingSub}>Verifying code & recording timestamp...</Text>
+          <Text style={styles.loadingSub}>Verifying code &amp; recording timestamp…</Text>
         </View>
       </View>
     );
   }
 
-  // ── SUCCESS / ERROR RESULT SCREEN ─────────────────────────────────────────
+  /* ── RESULT ──────────────────────────────────────────────────────────── */
+
+  const success = scanState === 'success';
+  const accent = success ? (isOfflineResult ? '#f59e0b' : '#10b981') : '#ef4444';
+
   return (
     <View style={styles.container}>
       <View style={styles.resultCard}>
-        <View
-          style={[
-            styles.resultIconRing,
-            {
-              backgroundColor:
-                scanState === 'success'
-                  ? isOfflineResult
-                    ? 'rgba(245, 158, 11, 0.18)'
-                    : 'rgba(16, 185, 129, 0.18)'
-                  : 'rgba(239, 68, 68, 0.18)',
-            },
-          ]}
-        >
+        <View style={[styles.resultIconRing, { backgroundColor: `${accent}2e` }]}>
           <MaterialCommunityIcons
-            name={
-              scanState === 'success'
-                ? isOfflineResult
-                  ? 'cloud-clock'
-                  : 'check-circle'
-                : 'alert-circle'
-            }
+            name={success ? (isOfflineResult ? 'cloud-clock' : 'check-circle') : 'alert-circle'}
             size={76}
-            color={
-              scanState === 'success'
-                ? isOfflineResult
-                  ? '#f59e0b'
-                  : '#10b981'
-                : '#ef4444'
-            }
+            color={accent}
           />
         </View>
 
         <Text style={styles.resultTitle}>
-          {scanState === 'success'
-            ? isOfflineResult
-              ? 'Saved Offline!'
-              : 'Verified!'
-            : 'Scan Failed'}
+          {success ? (isOfflineResult ? 'Saved Offline' : 'Verified') : 'Not Recorded'}
         </Text>
 
         <Text style={styles.resultMessage}>{resultMessage}</Text>
+        {!!resultDetail && <Text style={styles.resultDetail}>{resultDetail}</Text>}
 
         {isOfflineResult && (
           <View style={styles.offlineNoticeBox}>
             <MaterialCommunityIcons name="information-outline" size={16} color="#f59e0b" />
             <Text style={styles.offlineNoticeText}>
-              Your check-in timestamp has been locked. It will automatically submit with your exact arrival time when online.
+              Your exact scan time is locked on this device and submits automatically once you are back online.
             </Text>
           </View>
         )}
@@ -1040,6 +1274,240 @@ const styles = StyleSheet.create({
     borderRadius: 24,
   },
   permissionBtnText: {
+    color: '#001f3f',
+    fontWeight: '900',
+    fontSize: 14,
+  },
+
+  // New: sheet + schedule card additions
+  pendingSyncButtonAlert: {
+    backgroundColor: '#fbbf24',
+    shadowColor: '#fbbf24',
+  },
+  timeCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  timeCardHeaderText: {
+    flex: 1,
+    color: 'rgba(255, 255, 255, 0.5)',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  customBadge: {
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    backgroundColor: 'rgba(167, 139, 250, 0.22)',
+  },
+  customBadgeText: {
+    color: '#c4b5fd',
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.8,
+  },
+  offBadge: {
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    backgroundColor: 'rgba(148, 163, 184, 0.22)',
+  },
+  offBadgeText: {
+    color: '#cbd5e1',
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.8,
+  },
+  blockedNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(245, 158, 11, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(245, 158, 11, 0.3)',
+    borderRadius: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 20,
+    width: '100%',
+  },
+  blockedNoticeText: {
+    color: '#fbbf24',
+    fontSize: 11.5,
+    fontWeight: '700',
+    flex: 1,
+    lineHeight: 16,
+  },
+  resultDetail: {
+    fontSize: 12.5,
+    color: 'rgba(255, 255, 255, 0.5)',
+    textAlign: 'center',
+    marginTop: -14,
+    marginBottom: 22,
+    paddingHorizontal: 12,
+    fontWeight: '600',
+  },
+
+  // Offline queue sheet
+  sheetBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 10, 22, 0.72)',
+    justifyContent: 'flex-end',
+  },
+  sheet: {
+    backgroundColor: '#04203f',
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 28,
+    maxHeight: '82%',
+    borderTopWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 42,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    marginBottom: 16,
+  },
+  sheetHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 14,
+  },
+  sheetTitle: {
+    color: '#ffffff',
+    fontSize: 17,
+    fontWeight: '900',
+    letterSpacing: -0.3,
+  },
+  sheetSubtitle: {
+    color: 'rgba(255,255,255,0.5)',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  sheetClose: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sheetScroll: {
+    flexGrow: 0,
+  },
+  sheetEmpty: {
+    alignItems: 'center',
+    paddingVertical: 36,
+    gap: 12,
+  },
+  sheetEmptyText: {
+    color: 'rgba(255,255,255,0.5)',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  queueRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  queueRowFailed: {
+    backgroundColor: 'rgba(239,68,68,0.08)',
+    borderColor: 'rgba(239,68,68,0.22)',
+  },
+  queueIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  queueTitle: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  queueMeta: {
+    color: 'rgba(255,255,255,0.4)',
+    fontSize: 11,
+    fontWeight: '600',
+    marginTop: 1,
+  },
+  queueError: {
+    color: '#fbbf24',
+    fontSize: 11,
+    fontWeight: '600',
+    marginTop: 3,
+    lineHeight: 15,
+  },
+  queueDiscard: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  queueDiscardText: {
+    color: 'rgba(255,255,255,0.65)',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  sheetDivider: {
+    marginTop: 14,
+    marginBottom: 8,
+  },
+  sheetDividerText: {
+    color: 'rgba(255,255,255,0.35)',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  sheetGhostBtn: {
+    alignSelf: 'flex-start',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    marginTop: 4,
+  },
+  sheetGhostBtnText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  sheetNote: {
+    color: 'rgba(255,255,255,0.35)',
+    fontSize: 11,
+    fontWeight: '500',
+    lineHeight: 16,
+    marginTop: 10,
+  },
+  sheetPrimaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#00e5ff',
+    paddingVertical: 14,
+    borderRadius: 20,
+    marginTop: 14,
+  },
+  sheetPrimaryBtnText: {
     color: '#001f3f',
     fontWeight: '900',
     fontSize: 14,

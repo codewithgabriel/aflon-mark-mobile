@@ -34,12 +34,26 @@ const API_SECRET_KEY = process.env.EXPO_PUBLIC_API_SECRET || 'supersecret_aflon_
 
 export class APIError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /**
+   * Machine-readable reason from the backend (see lib/attendance.js CODES).
+   * The offline queue uses this to tell a scan that can be retried apart from
+   * one that will be rejected forever.
+   */
+  code?: string;
+  payload?: any;
+
+  constructor(message: string, status: number, code?: string, payload?: any) {
     super(message);
     this.name = 'APIError';
     this.status = status;
+    this.code = code;
+    this.payload = payload;
   }
 }
+
+/** True when the request never got a usable answer out of the server. */
+export const isNetworkFailure = (err: unknown): boolean =>
+  err instanceof APIError && (err.status === 0 || err.status >= 500);
 
 export const fetchAPI = async (endpoint: string, options: any = {}) => {
   const url = `${API_BASE_URL}/api${endpoint}`;
@@ -50,21 +64,27 @@ export const fetchAPI = async (endpoint: string, options: any = {}) => {
     ...(options.headers || {}),
   };
 
-  // Network-level errors (no connection, timeout, etc.)
+  // Network-level errors (no connection, timeout, aborted, DNS, …)
   let response: Response;
   try {
     response = await fetch(url, { ...options, headers });
   } catch (networkError: any) {
-    console.error(`[Network Error] ${endpoint}:`, networkError.message);
+    console.error(`[Network Error] ${endpoint}:`, networkError?.message);
     throw new APIError('Network error — check your connection.', 0);
   }
 
-  const data = await response.json();
+  // A gateway or proxy can answer with HTML instead of JSON. Treat an
+  // unparseable body as a server-side failure rather than crashing the caller.
+  let data: any = null;
+  try {
+    data = await response.json();
+  } catch {
+    if (response.ok) return null;
+    throw new APIError(`Server returned ${response.status}.`, response.status);
+  }
 
-  // API-level errors (4xx, 5xx) — known, expected, not a crash
   if (!response.ok) {
-    const message = data?.error || 'Something went wrong.';
-    throw new APIError(message, response.status);
+    throw new APIError(data?.error || 'Something went wrong.', response.status, data?.code, data);
   }
 
   return data;

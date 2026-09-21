@@ -1,14 +1,16 @@
 {
   "name": "aflonmark",
   "main": "expo-router/entry",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "scripts": {
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "test:offline": "node tests/offline/run.mjs",
+    "test": "node tests/offline/run.mjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
